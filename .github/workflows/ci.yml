@@ -33,7 +33,6 @@ jobs:
           python3 scripts/delta.py --limit "${{ github.event.inputs.limit || '20000' }}" --rate 8 >/tmp/delta.log 2>&1
           echo "count=$(wc -l < new_refs.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
       - name: State
-        if: steps.delta.outputs.count != '0'
         run: |
           cd core
           git config user.name "gh-bot"
