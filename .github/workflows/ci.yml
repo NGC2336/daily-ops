@@ -5,10 +5,10 @@ on:
     - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
-      limit:
-        description: "Repositories to check in this run"
+      shards:
+        description: "Shards to use"
         required: false
-        default: "20000"
+        default: "12"
 
 permissions:
   contents: read
@@ -17,72 +17,146 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
-      matrix: ${{ steps.split.outputs.matrix }}
-      count: ${{ steps.delta.outputs.count }}
-      date: ${{ steps.split.outputs.date }}
+      since: ${{ steps.meta.outputs.since }}
+      run_start: ${{ steps.meta.outputs.run_start }}
+      date: ${{ steps.meta.outputs.date }}
+      shards: ${{ steps.meta.outputs.shards }}
+      matrix: ${{ steps.shards.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
         with:
           repository: ${{ secrets.PRIVATE_REPO }}
           token: ${{ secrets.PRIVATE_REPO_PAT }}
           path: core
-      - name: Sync
-        id: delta
+      - name: Meta
+        id: meta
         run: |
-          cd core
-          python3 scripts/delta.py --limit "${{ github.event.inputs.limit || '20000' }}" --rate 8 >/tmp/delta.log 2>&1
-          echo "count=$(wc -l < new_refs.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
-      - name: State
+          echo "since=$(cat core/state/last_sync.txt)" >> "$GITHUB_OUTPUT"
+          echo "run_start=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%F)" >> "$GITHUB_OUTPUT"
+          echo "shards=${{ github.event.inputs.shards || '12' }}" >> "$GITHUB_OUTPUT"
+      - name: Shards
+        id: shards
         run: |
-          cd core
-          git config user.name "gh-bot"
-          git config user.email "gh-bot@users.noreply.github.com"
-          git add state
-          git diff --cached --quiet || git commit -m "state $(date -u +%F)"
-          git push
-      - name: Split
-        id: split
-        if: steps.delta.outputs.count != '0'
-        run: |
-          day=$(date -u +%F)
-          echo "date=$day" >> "$GITHUB_OUTPUT"
-          DAY="$day" python3 - <<'PY'
+          SHARDS="${{ steps.meta.outputs.shards }}" python3 - <<'PY'
           import json, math, os
           from pathlib import Path
-          day = os.environ["DAY"]
-          refs = [l.strip() for l in open("core/new_refs.txt") if l.strip()]
-          n = len(refs)
-          chunk = 50
-          chunks = min(max(1, math.ceil(n / chunk)), 40)
-          size = math.ceil(n / chunks) if n else 1
-          d = Path("core/run-data") / day / "chunks"
-          d.mkdir(parents=True, exist_ok=True)
+          lines = Path("core/state/repos.tsv").read_text().splitlines()
+          repos = [l for l in lines[1:] if l.strip()]
+          n = max(1, int(os.environ["SHARDS"]))
+          size = math.ceil(len(repos) / n)
+          d = Path("shards"); d.mkdir(exist_ok=True)
           inc = []
-          for i in range(chunks):
-              batch = refs[i * size:(i + 1) * size]
-              (d / f"chunk-{i}.txt").write_text("\n".join(batch))
-              inc.append({"chunk": i})
+          for i in range(n):
+              (d / f"shard-{i}.txt").write_text("\n".join(repos[i*size:(i+1)*size]))
+              inc.append({"shard": i})
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write("matrix=" + json.dumps({"include": inc}) + "\n")
-          print(f"chunks={chunks}")
+          print(f"repos={len(repos)} shards={n} size={size}")
           PY
-      - name: Store chunks
-        if: steps.delta.outputs.count != '0'
-        run: |
-          cd core
-          git config user.name "gh-bot"
-          git config user.email "gh-bot@users.noreply.github.com"
-          git add run-data
-          git diff --cached --quiet || git commit -m "run $(date -u +%F)"
-          git push
+      - uses: actions/upload-artifact@v4
+        with:
+          name: repo-shards
+          path: shards
+          if-no-files-found: error
 
   process:
     needs: setup
-    if: needs.setup.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 350
     strategy:
       matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          name: repo-shards
+          path: shards
+      - name: Check tags
+        run: |
+          python3 core/scripts/delta.py \
+            --repos-file "shards/shard-${{ matrix.shard }}.txt" \
+            --since "${{ needs.setup.outputs.since }}" \
+            --out "new-${{ matrix.shard }}.txt" \
+            --rate 5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: new-refs-${{ matrix.shard }}
+          path: new-${{ matrix.shard }}.txt
+          if-no-files-found: error
+
+  merge:
+    needs: [setup, process]
+    runs-on: ubuntu-latest
+    outputs:
+      count: ${{ steps.merge.outputs.count }}
+      date: ${{ needs.setup.outputs.date }}
+      matrix: ${{ steps.merge.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: new-refs-*
+          merge-multiple: true
+          path: new
+      - name: Merge
+        id: merge
+        run: |
+          cat new/new-*.txt 2>/dev/null | sed '/^$/d' | sort -u > new_refs.txt || true
+          count=$(wc -l < new_refs.txt | tr -d ' ')
+          echo "count=$count" >> "$GITHUB_OUTPUT"
+          DAY="${{ needs.setup.outputs.date }}" COUNT="$count" RUN_START="${{ needs.setup.outputs.run_start }}" python3 - <<'PY'
+          import json, math, os
+          from pathlib import Path
+          day = os.environ["DAY"]; count = int(os.environ["COUNT"]); run_start = os.environ["RUN_START"]
+          new = [l.strip() for l in open("new_refs.txt") if l.strip()]
+          refs_path = Path("core/state/refs.txt")
+          known = set(l.strip() for l in refs_path.read_text().splitlines() if l.strip())
+          before = len(known)
+          known.update(new)
+          refs_path.write_text("\n".join(sorted(known)) + "\n")
+          Path("core/state/last_sync.txt").write_text(run_start + "\n")
+          Path("core/state/last_run.json").write_text(json.dumps({"checked": "full", "new": len(new), "total_refs": len(known)}) + "\n")
+          if count:
+              chunk = 50
+              chunks = min(max(1, math.ceil(count / chunk)), 80)
+              size = math.ceil(count / chunks)
+              d = Path("core/run-data") / day / "chunks"
+              d.mkdir(parents=True, exist_ok=True)
+              inc = []
+              for i in range(chunks):
+                  (d / f"chunk-{i}.txt").write_text("\n".join(new[i*size:(i+1)*size]))
+                  inc.append({"chunk": i})
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("matrix=" + json.dumps({"include": inc}) + "\n")
+              print(f"chunks={chunks} new={len(new)} refs={before}->{len(known)}")
+          else:
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("matrix=" + json.dumps({"include": []}) + "\n")
+              print("no new refs")
+          PY
+          cd core
+          git config user.name "gh-bot"
+          git config user.email "gh-bot@users.noreply.github.com"
+          git add state run-data 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "state $(date -u +%F)"
+          git push || (git pull --rebase && git push) || true
+
+  scan:
+    needs: merge
+    if: needs.merge.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      matrix: ${{ fromJson(needs.merge.outputs.matrix) }}
       fail-fast: false
       max-parallel: 8
     steps:
@@ -93,11 +167,13 @@ jobs:
           path: core
       - name: Run
         run: |
-          bash core/scripts/scan.sh "core/run-data/${{ needs.setup.outputs.date }}/chunks/chunk-${{ matrix.chunk }}.txt" "/tmp/out-${{ matrix.chunk }}"
+          bash core/scripts/scan.sh \
+            "core/run-data/${{ needs.merge.outputs.date }}/chunks/chunk-${{ matrix.chunk }}.txt" \
+            "/tmp/out-${{ matrix.chunk }}"
       - name: Save
         if: always()
         run: |
-          day="${{ needs.setup.outputs.date }}"
+          day="${{ needs.merge.outputs.date }}"
           chunk="${{ matrix.chunk }}"
           cd core
           mkdir -p "run-data/$day/findings/chunk-$chunk"
@@ -113,8 +189,8 @@ jobs:
           done
 
   report:
-    needs: [setup, process]
-    if: always() && needs.setup.outputs.count != '0' && needs.setup.result == 'success'
+    needs: [merge, scan]
+    if: always() && needs.merge.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,33 +200,34 @@ jobs:
           path: core
       - name: Aggregate
         run: |
-          day="${{ needs.setup.outputs.date }}"
+          day="${{ needs.merge.outputs.date }}"
           cd core
           mkdir -p "findings/$day"
-          cp -r "run-data/$day/findings/." "findings/$day/" 2>/dev/null || true
+          if [ -d "run-data/$day/findings" ]; then
+            cp -r "run-data/$day/findings/." "findings/$day/" 2>/dev/null || true
+          fi
           DAY="$day" python3 - <<'PY'
           import glob, json, os
           day = os.environ["DAY"]
           rows = []
           for p in glob.glob(f"findings/{day}/**/*.status.json", recursive=True):
-              try:
-                  rows.append(json.load(open(p)))
-              except Exception:
-                  pass
+              try: rows.append(json.load(open(p)))
+              except Exception: pass
           ok = sum(1 for r in rows if r.get("status") == "ok")
           th = sum(int(r.get("trufflehog_lines") or 0) for r in rows)
           gl = sum(int(r.get("gitleaks_hits") or 0) for r in rows)
           tv = sum(int(r.get("trivy_hits") or 0) for r in rows)
           with open(f"findings/{day}/summary.md", "w") as f:
               f.write(f"# {day}\n\nImages: {len(rows)} (ok {ok})\nTruffleHog lines: {th}\nGitleaks hits: {gl}\nTrivy hits: {tv}\n")
-          print(f"images={len(rows)} ok={ok} th={th} gl={gl} tv={tv}")
+          print(f"images={len(rows)} ok={ok}")
           PY
           rm -rf "run-data/$day"
+          find findings -mindepth 1 -maxdepth 1 -type d -name '20*' | sort | head -n -2 | xargs -r rm -rf
           git config user.name "gh-bot"
           git config user.email "gh-bot@users.noreply.github.com"
           for i in 1 2 3 4 5; do
             git pull --rebase origin main >/dev/null 2>&1 || true
-            git add "findings/$day" run-data
+            git add findings run-data 2>/dev/null || true
             git diff --cached --quiet && break
             git commit -m "report $day" >/dev/null && git push >/dev/null 2>&1 && break
             sleep "$i"
