@@ -6,22 +6,153 @@ on:
   workflow_dispatch:
     inputs:
       limit:
-        description: "Optional small limit for a manual run"
+        description: "Repositories to check in this run"
         required: false
-        default: "20"
+        default: "20000"
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  setup:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    outputs:
+      matrix: ${{ steps.split.outputs.matrix }}
+      count: ${{ steps.delta.outputs.count }}
+      date: ${{ steps.split.outputs.date }}
     steps:
-      - name: Run
-        env:
-          T: ${{ secrets.HUNT_DATA_TOKEN }}
-          DELTA_LIMIT: ${{ github.event.inputs.limit || '20000' }}
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+      - name: Sync
+        id: delta
         run: |
-          git clone --depth 1 "https://x-access-token:${T}@github.com/0xVijay/ecr-hunt-data.git" .w
-          bash .w/scripts/run.sh
+          cd core
+          python3 scripts/delta.py --limit "${{ github.event.inputs.limit || '20000' }}" --rate 8 >/tmp/delta.log 2>&1
+          echo "count=$(wc -l < new_refs.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+      - name: State
+        if: steps.delta.outputs.count != '0'
+        run: |
+          cd core
+          git config user.name "gh-bot"
+          git config user.email "gh-bot@users.noreply.github.com"
+          git add state
+          git diff --cached --quiet || git commit -m "state $(date -u +%F)"
+          git push
+      - name: Split
+        id: split
+        if: steps.delta.outputs.count != '0'
+        run: |
+          day=$(date -u +%F)
+          echo "date=$day" >> "$GITHUB_OUTPUT"
+          DAY="$day" python3 - <<'PY'
+          import json, math, os
+          from pathlib import Path
+          day = os.environ["DAY"]
+          refs = [l.strip() for l in open("core/new_refs.txt") if l.strip()]
+          n = len(refs)
+          chunk = 50
+          chunks = min(max(1, math.ceil(n / chunk)), 40)
+          size = math.ceil(n / chunks) if n else 1
+          d = Path("core/run-data") / day / "chunks"
+          d.mkdir(parents=True, exist_ok=True)
+          inc = []
+          for i in range(chunks):
+              batch = refs[i * size:(i + 1) * size]
+              (d / f"chunk-{i}.txt").write_text("\n".join(batch))
+              inc.append({"chunk": i})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("matrix=" + json.dumps({"include": inc}) + "\n")
+          print(f"chunks={chunks}")
+          PY
+      - name: Store chunks
+        if: steps.delta.outputs.count != '0'
+        run: |
+          cd core
+          git config user.name "gh-bot"
+          git config user.email "gh-bot@users.noreply.github.com"
+          git add run-data
+          git diff --cached --quiet || git commit -m "run $(date -u +%F)"
+          git push
+
+  process:
+    needs: setup
+    if: needs.setup.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      fail-fast: false
+      max-parallel: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+      - name: Run
+        run: |
+          bash core/scripts/scan.sh "core/run-data/${{ needs.setup.outputs.date }}/chunks/chunk-${{ matrix.chunk }}.txt" "/tmp/out-${{ matrix.chunk }}"
+      - name: Save
+        if: always()
+        run: |
+          day="${{ needs.setup.outputs.date }}"
+          chunk="${{ matrix.chunk }}"
+          cd core
+          mkdir -p "run-data/$day/findings/chunk-$chunk"
+          cp -r "/tmp/out-$chunk/." "run-data/$day/findings/chunk-$chunk/" 2>/dev/null || true
+          git config user.name "gh-bot"
+          git config user.email "gh-bot@users.noreply.github.com"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main >/dev/null 2>&1 || true
+            git add "run-data/$day/findings/chunk-$chunk"
+            git diff --cached --quiet && break
+            git commit -m "findings $day/$chunk" >/dev/null && git push >/dev/null 2>&1 && break
+            sleep "$i"
+          done
+
+  report:
+    needs: [setup, process]
+    if: always() && needs.setup.outputs.count != '0' && needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.PRIVATE_REPO }}
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+          path: core
+      - name: Aggregate
+        run: |
+          day="${{ needs.setup.outputs.date }}"
+          cd core
+          mkdir -p "findings/$day"
+          cp -r "run-data/$day/findings/." "findings/$day/" 2>/dev/null || true
+          DAY="$day" python3 - <<'PY'
+          import glob, json, os
+          day = os.environ["DAY"]
+          rows = []
+          for p in glob.glob(f"findings/{day}/**/*.status.json", recursive=True):
+              try:
+                  rows.append(json.load(open(p)))
+              except Exception:
+                  pass
+          ok = sum(1 for r in rows if r.get("status") == "ok")
+          th = sum(int(r.get("trufflehog_lines") or 0) for r in rows)
+          gl = sum(int(r.get("gitleaks_hits") or 0) for r in rows)
+          tv = sum(int(r.get("trivy_hits") or 0) for r in rows)
+          with open(f"findings/{day}/summary.md", "w") as f:
+              f.write(f"# {day}\n\nImages: {len(rows)} (ok {ok})\nTruffleHog lines: {th}\nGitleaks hits: {gl}\nTrivy hits: {tv}\n")
+          print(f"images={len(rows)} ok={ok} th={th} gl={gl} tv={tv}")
+          PY
+          rm -rf "run-data/$day"
+          git config user.name "gh-bot"
+          git config user.email "gh-bot@users.noreply.github.com"
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main >/dev/null 2>&1 || true
+            git add "findings/$day" run-data
+            git diff --cached --quiet && break
+            git commit -m "report $day" >/dev/null && git push >/dev/null 2>&1 && break
+            sleep "$i"
+          done
