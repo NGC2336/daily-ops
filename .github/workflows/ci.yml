@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Optional small limit for a manual run"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Run
+        env:
+          T: ${{ secrets.HUNT_DATA_TOKEN }}
+          DELTA_LIMIT: ${{ github.event.inputs.limit || '20000' }}
+        run: |
+          git clone --depth 1 "https://x-access-token:${T}@github.com/0xVijay/ecr-hunt-data.git" .w
+          bash .w/scripts/run.sh
