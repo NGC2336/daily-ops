@@ -111,25 +111,31 @@ jobs:
         id: merge
         run: |
           cat new/new-*.txt 2>/dev/null | sed '/^$/d' | sort -u > new_refs.txt || true
-          count=$(wc -l < new_refs.txt | tr -d ' ')
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          DAY="${{ needs.setup.outputs.date }}" COUNT="$count" RUN_START="${{ needs.setup.outputs.run_start }}" python3 - <<'PY'
+          DAY="${{ needs.setup.outputs.date }}" RUN_START="${{ needs.setup.outputs.run_start }}" python3 - <<'PY'
           import json, math, os
           from pathlib import Path
-          day = os.environ["DAY"]; count = int(os.environ["COUNT"]); run_start = os.environ["RUN_START"]
+          day = os.environ["DAY"]; run_start = os.environ["RUN_START"]
           new = [l.strip() for l in open("new_refs.txt") if l.strip()]
           refs_path = Path("core/state/refs.txt")
           known = set(l.strip() for l in refs_path.read_text().splitlines() if l.strip())
+          ledger = Path("core/state/scanned")
+          if ledger.exists():
+              for p in ledger.rglob("*.txt"):
+                  known.update(l.strip() for l in p.read_text().splitlines() if l.strip())
+          new = sorted(set(new) - known)
           before = len(known)
-          known.update(new)
-          refs_path.write_text("\n".join(sorted(known)) + "\n")
-          Path("core/state/last_sync.txt").write_text(run_start + "\n")
-          Path("core/state/last_run.json").write_text(json.dumps({"checked": "full", "new": len(new), "total_refs": len(known)}) + "\n")
+          run_dir = Path("core/run-data") / day
+          run_dir.mkdir(parents=True, exist_ok=True)
+          (run_dir / "run_start.txt").write_text(run_start + "\n")
+          Path("core/state/last_run.json").write_text(json.dumps({"checked": "full", "new": len(new), "total_refs": before}) + "\n")
+          count = len(new)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"count={count}\n")
           if count:
-              chunk = 50
+              chunk = 250
               chunks = min(max(1, math.ceil(count / chunk)), 80)
               size = math.ceil(count / chunks)
-              d = Path("core/run-data") / day / "chunks"
+              d = run_dir / "chunks"
               d.mkdir(parents=True, exist_ok=True)
               inc = []
               for i in range(chunks):
@@ -137,7 +143,7 @@ jobs:
                   inc.append({"chunk": i})
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("matrix=" + json.dumps({"include": inc}) + "\n")
-              print(f"chunks={chunks} new={len(new)} refs={before}->{len(known)}")
+              print(f"chunks={chunks} new={count} known={before}")
           else:
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write("matrix=" + json.dumps({"include": []}) + "\n")
@@ -158,7 +164,7 @@ jobs:
     strategy:
       matrix: ${{ fromJson(needs.merge.outputs.matrix) }}
       fail-fast: false
-      max-parallel: 8
+      max-parallel: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -167,22 +173,34 @@ jobs:
           path: core
       - name: Run
         run: |
-          bash core/scripts/scan.sh \
-            "core/run-data/${{ needs.merge.outputs.date }}/chunks/chunk-${{ matrix.chunk }}.txt" \
-            "/tmp/out-${{ matrix.chunk }}"
+          day="${{ needs.merge.outputs.date }}"
+          mkdir -p "core/state/scanned/$day"
+          python3 core/scripts/daily_gate.py filter \
+            --input "core/run-data/$day/chunks/chunk-${{ matrix.chunk }}.txt" \
+            --dir "core/state/scanned/$day" \
+            --out "/tmp/scan-${{ matrix.chunk }}.txt"
+          if [ ! -s "/tmp/scan-${{ matrix.chunk }}.txt" ]; then
+            echo "already scanned today; skip"
+            exit 0
+          fi
+          bash core/scripts/scan.sh "/tmp/scan-${{ matrix.chunk }}.txt" "/tmp/out-${{ matrix.chunk }}"
       - name: Save
         if: always()
         run: |
           day="${{ needs.merge.outputs.date }}"
           chunk="${{ matrix.chunk }}"
           cd core
+          if [ -s "/tmp/scan-$chunk.txt" ]; then
+            mkdir -p "state/scanned/$day"
+            cp "/tmp/scan-$chunk.txt" "state/scanned/$day/chunk-$chunk.txt"
+          fi
           mkdir -p "run-data/$day/findings/chunk-$chunk"
           cp -r "/tmp/out-$chunk/." "run-data/$day/findings/chunk-$chunk/" 2>/dev/null || true
           git config user.name "gh-bot"
           git config user.email "gh-bot@users.noreply.github.com"
           for i in 1 2 3 4 5; do
             git pull --rebase origin main >/dev/null 2>&1 || true
-            git add "run-data/$day/findings/chunk-$chunk"
+            git add "run-data/$day/findings/chunk-$chunk" "state/scanned/$day" 2>/dev/null || true
             git diff --cached --quiet && break
             git commit -m "findings $day/$chunk" >/dev/null && git push >/dev/null 2>&1 && break
             sleep "$i"
@@ -221,13 +239,30 @@ jobs:
               f.write(f"# {day}\n\nImages: {len(rows)} (ok {ok})\nTruffleHog lines: {th}\nGitleaks hits: {gl}\nTrivy hits: {tv}\n")
           print(f"images={len(rows)} ok={ok}")
           PY
+          DAY="$day" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          day = os.environ["DAY"]
+          refs_path = Path("state/refs.txt")
+          known = set(l.strip() for l in refs_path.read_text().splitlines() if l.strip())
+          ledger = Path("state/scanned")
+          if ledger.exists():
+              for p in ledger.rglob("*.txt"):
+                  known.update(l.strip() for l in p.read_text().splitlines() if l.strip())
+          refs_path.write_text("\n".join(sorted(known)) + "\n")
+          run_start = Path(f"run-data/{day}/run_start.txt")
+          if run_start.exists():
+              Path("state/last_sync.txt").write_text(run_start.read_text().strip() + "\n")
+          print(f"refs={len(known)}")
+          PY
+          rm -rf state/scanned
           rm -rf "run-data/$day"
           find findings -mindepth 1 -maxdepth 1 -type d -name '20*' | sort | head -n -2 | xargs -r rm -rf
           git config user.name "gh-bot"
           git config user.email "gh-bot@users.noreply.github.com"
           for i in 1 2 3 4 5; do
             git pull --rebase origin main >/dev/null 2>&1 || true
-            git add findings run-data 2>/dev/null || true
+            git add findings run-data state 2>/dev/null || true
             git diff --cached --quiet && break
             git commit -m "report $day" >/dev/null && git push >/dev/null 2>&1 && break
             sleep "$i"
