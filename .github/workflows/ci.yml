@@ -1,5 +1,9 @@
 name: CI
 
+concurrency:
+  group: ecr-daily-${{ github.ref }}
+  cancel-in-progress: false
+
 on:
   schedule:
     - cron: "0 2 * * *"
